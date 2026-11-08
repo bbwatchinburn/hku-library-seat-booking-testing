@@ -1,232 +1,252 @@
 # HKU Library Seat Booking
 
-> 当前版本：`0.1.0`，首个公开预览版。
+> Current version: `0.1.0` - an early public testing release.
 
-一个面向 Windows 10/11 的香港大学图书馆座位自动预约小工具。用户录入自己的港大预约信息后，程序常驻桌面右下角，显示放号倒计时、当前阶段和目标信息，并在设定时刻自动提交预约；除非用户主动关闭，否则会继续等待下一次放号。
+A lightweight Windows 10/11 utility for booking seats at The University of Hong Kong (HKU) Libraries. After the user provides their own booking information, the app stays in the corner of the desktop, shows the release countdown and current status, and attempts to submit a booking at the configured release time. It continues monitoring for the next release unless the user closes it.
 
-项目沿用 [SeatKiller-GUI](https://github.com/yeliudev/SeatKiller-GUI) 的核心流程思路：本地保存配置、定时等待、到点提交、失败重试和持续监听。网络与表单层已针对香港大学图书馆预约系统重新实现，没有复用武汉大学的 REST 接口。
+The scheduling and retry workflow follows the same general approach as [SeatKiller-GUI](https://github.com/yeliudev/SeatKiller-GUI): save configuration locally, wait for the target time, submit the booking, retry on failure, and continue monitoring.
 
-## 项目解决的问题
+## What Problem This Solves
 
-港大图书馆座位需要在指定时段预约，热门时段可能很快被订满。手动盯着时间、反复刷新页面并在正确时刻提交，容易错过放号窗口。
+HKU library seats must be booked for specific dates and time slots. Popular slots may fill quickly, so manually checking the page and submitting at the correct moment can lead to missed opportunities.
 
-本项目只处理一条核心链路：
+This project focuses on one core workflow:
 
 ```text
-录入预约配置 -> 读取并校验 Cookie/登录状态 -> 等待放号
--> 自动选择馆区和日期 -> 提交目标时段/座位 -> 展示预约结果
+Enter booking settings -> validate Cookie/login access -> wait for release
+-> select the target library and date -> submit the slot and seat -> show the result
 ```
 
-它不会代替用户到馆签到，也不会绕过港大登录、验证码、权限或其他访问控制。
+The application does not replace required on-site check-in. It does not bypass HKU authentication, CAPTCHA, authorization, or any other access control.
 
-## 主要功能
+## Main Features
 
-- 首次启动弹出设置窗口，录入用户名、密码、Cookie、馆区、座位、预约时段和重试参数。
-- 配置保存到 `%LOCALAPPDATA%\HKU-Library-Seat-Booking\settings.json`；密码和 Cookie 使用当前 Windows 用户的 DPAPI 加密，文件中不保存明文。
-- 按香港时间计算下一次放号，默认每天 `00:00`，可在设置中修改；目标日期默认是放号后第 1 天，可配置为第 0–7 天。
-- 在放号前约 20 秒加载预约页面，读取服务器 `Date` 响应头校准本机时间，然后在放号时刻提交。
-- 自动识别港大 ASP.NET WebForms 的 `__VIEWSTATE`、`__EVENTVALIDATION`、馆区、设施类型、日期、时段、座位和提交控件。
-- 支持 Cookie 直连，也支持页面存在普通 HTML 登录表单时的账号密码登录。港大若跳转统一身份认证，应使用 Cookie 模式。
-- 支持失败自动重试，重试次数可配置为 `0–50`，单次间隔可配置为 `100–60000` 毫秒。
-- 悬浮窗默认位于当前屏幕工作区右下角，始终置顶、无边框、可拖动，并可保存窗口位置。
-- 可配置窗口透明度 `35%–100%`。
-- 最小化后隐藏到系统托盘；可从托盘恢复窗口、打开设置或退出。
-- 显示等待、准备页面、提交、重试、成功、失败和需要重新登录等状态。
-- 仅运行当前用户的一个港大账号，不包含云同步、远程通知、批量抢座或复杂仪表盘。
+- Shows a first-run setup dialog for account details, Cookie, target library, seat, time slot, release time, and retry settings.
+- Stores settings at `%LOCALAPPDATA%\HKU-Library-Seat-Booking\settings.json`.
+- Encrypts the password and Cookie with Windows DPAPI for the current Windows user; plaintext credentials are not written to the settings file.
+- Calculates the next release in Hong Kong time. The default is `00:00`, and the release time is configurable.
+- Supports a target date offset from `0` to `7` days after the release date.
+- Loads the booking page about 20 seconds before release and compares the server `Date` header with local time.
+- Understands ASP.NET WebForms fields including `__VIEWSTATE`, `__EVENTVALIDATION`, library, facility type, date, slot, seat, and submission controls.
+- Supports Cookie-based sessions and ordinary HTML login forms. Cookie mode should be used when HKU redirects through single sign-on.
+- Supports configurable retries from `0` to `50`, with a retry interval from `100` to `60000` milliseconds.
+- Provides a compact, borderless, always-on-top floating window that can be dragged and remembers its position.
+- Supports configurable opacity from `35%` to `100%`.
+- Can be minimized to the system tray and restored from the tray.
+- Displays waiting, page preparation, submission, retry, success, failure, and authentication-required states.
+- Runs one account for the current user and does not provide cloud sync, remote notifications, bulk booking, or a complex dashboard.
 
-## 港大预约规则
+## HKU Booking Rules
 
-香港大学图书馆当前公开入口是 [Book a Space](https://lib.hku.hk/general/e-form/book-a-space.html)，实际预约系统为 `https://booking.lib.hku.hk/`，登录后的 Study Table 页面是 `Secure/FacilityStatusDate.aspx`。程序会根据 `Location`、`Facility Type`、`Date` 三个 ASP.NET WebForms 下拉框自动选择目标，并继续处理日期、时段和座位页面。公开的 [Booking Policy](https://lib.hku.hk/general/e-form/L3_booking_policy.html) 说明 Study Tables 通常可提前一个时段预约，并给出了周一至周五、周末/公众假期的时段：
+The public HKU Libraries entry point is [Book a Space](https://lib.hku.hk/general/e-form/book-a-space.html). The actual booking system is hosted at `https://booking.lib.hku.hk/`. After login, the Study Table search page is `Secure/FacilityStatusDate.aspx`.
 
-| 时段 | 周一至周五 | 周六、周日及公众假期 |
+The app selects the `Location`, `Facility Type`, and `Date` WebForms fields and continues through the available slot and seat pages.
+
+According to the public [Booking Policy](https://lib.hku.hk/general/e-form/L3_booking_policy.html), Study Tables are generally available for booking one session in advance:
+
+| Session | Monday to Friday | Saturday, Sunday, and public holidays |
 | --- | --- | --- |
-| 第 1 时段 | 08:30–13:00 | 09:00–13:00 |
-| 第 2 时段 | 13:00–18:00 | 13:00–17:00 |
-| 第 3 时段 | 18:00–22:00 | 无 |
+| Session 1 | 08:30-13:00 | 09:00-13:00 |
+| Session 2 | 13:00-18:00 | 13:00-17:00 |
+| Session 3 | 18:00-22:00 | Not available |
 
-公开政策没有给出一个对所有馆区、所有学期都固定不变的“精确放号钟点”。因此程序默认按每天 `00:00` 开始监听，并把放号时间放在设置中供你按当前页面实际规则修改。目标日期默认是“放号后第 1 天”，也可改为第 0–7 天。
+HKU does not publish one permanent clock time that applies to every library, semester, and booking period. The app therefore defaults to `00:00` in Hong Kong time and makes the release time configurable.
 
-一个时段占满日期范围或开放规则变化时，应以港大预约系统当天页面为准。程序不会绕过验证码、统一身份认证或其他访问控制。
+Always verify the current rules in the HKU booking system. Availability, opening times, and page structure may change without notice.
 
-## 安装方法
+## Installation
 
-项目不需要安装 .NET SDK、Node.js、Python、PyQt、Electron 或第三方 NuGet 包。Windows 10/11 通常已自带：
+No .NET SDK, Node.js, Python, PyQt, Electron, or third-party NuGet package is required. A typical Windows 10/11 installation includes:
 
 - Windows PowerShell 5.x
 - .NET Framework 4.x
-- 官方 C# 编译器 `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`
-- Windows Forms、System.Drawing、System.Security 和 System.Runtime.Serialization
+- The built-in C# compiler at `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`
+- Windows Forms, System.Drawing, System.Security, and System.Runtime.Serialization
 
-安装步骤：
+Installation steps:
 
-1. 将整个 `hku-library-seat-booking` 文件夹放到希望保存的位置。
-2. 项目已包含编译好的 `bin\HkuLibrarySeatBooking.exe`，可以直接双击运行。
-3. 如果修改了源码，可运行 `run.ps1`，脚本会自动检查并重新编译。
+1. Download or clone the complete `hku-library-seat-booking` project.
+2. Run `bin\HkuLibrarySeatBooking.exe` directly, or use `run.ps1` to rebuild and launch it.
+3. No administrator privileges are required. The app does not install a service or driver.
 
-程序使用普通用户权限运行，不需要管理员权限，也不会安装后台服务或驱动程序。
-
-从 PowerShell 启动：
+Start with PowerShell:
 
 ```powershell
 cd ".\hku-library-seat-booking"
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
 ```
 
-构建但不启动：
+Build without launching:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -BuildOnly
 ```
 
-运行自测：
+Run the automated self-tests:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Test
 ```
 
-编译输出为 `bin\HkuLibrarySeatBooking.exe`。运行脚本不会初始化 Git 仓库，也不会联网上传源码或配置。
+The build output is `bin\HkuLibrarySeatBooking.exe`.
 
-## 使用方法
+## Usage
 
-1. 首次启动后填写：
+1. Start the application and complete the first-run settings dialog.
+2. Enter the following information:
 
-   - `HKU 用户名`：Cookie 模式可留空。
-   - `密码`：Cookie 模式可留空。
-   - `浏览器 Cookie`：推荐填写，支持港大统一身份认证后的会话。
-   - `目标馆区`：例如 `Main Library 4/F Study Tables`。
-   - `目标座位`：填写页面显示的座位号；留空时自动匹配第一个非禁用座位。
-   - `预约时段`：第 1、第 2、第 3 时段或自定义时段。
-   - `每天放号时间`：默认 `00:00`，按港大当前实际规则调整。
-   - `目标日期`：相对放号日的偏移，`1` 表示预约放号后的第 1 天。
-   - `失败自动重试次数` 和 `重试间隔`。
-   - `窗口透明度`。
+   - **HKU username:** optional when Cookie mode is enabled.
+   - **Password:** optional when Cookie mode is enabled.
+   - **Browser Cookie:** recommended for HKU single sign-on sessions.
+   - **Target library:** for example, `Main Library 4/F Study Tables`.
+   - **Target seat:** the seat identifier shown by HKU. If left empty, the app selects the first matching non-disabled seat.
+   - **Time slot:** session 1, 2, 3, or a custom start and end time.
+   - **Daily release time:** defaults to `00:00`.
+   - **Target date offset:** `1` means the day after the release date.
+   - **Retry count and interval.**
+   - **Window opacity.**
 
-2. 保存设置后，程序开始显示倒计时。目标馆区、日期、时段和座位会显示在倒计时下方。
+3. Save the settings. The floating window displays the countdown and target information.
+4. About 20 seconds before release, the status changes to page preparation.
+5. At the configured time, the app submits the booking and displays the result.
+6. Use Settings to change the configuration, `-` to hide the window in the system tray, and `X` to exit.
+7. Verify the final result in HKU `My Booking Record`.
 
-3. 在放号前约 20 秒，状态会变为“正在准备预约页面”。Cookie 无效、页面结构变化或目标日期未开放时，窗口会显示具体原因。
+## Getting the Browser Cookie
 
-4. 到点后程序提交预约并展示结果：
+1. Open `https://booking.lib.hku.hk/` in Microsoft Edge and sign in manually.
+2. Open a page such as `Facility Status`, `View By Date`, or `New Booking`.
+3. Press `F12` and open the **Network** tab.
+4. Refresh the page with `Ctrl+R`.
+5. Select a request to `booking.lib.hku.hk`, such as `FacilityStatusDate.aspx`.
+6. Open **Headers** and locate the **Request Headers** section.
+7. Find the `Cookie:` line and copy only the value after `Cookie:`.
+8. Paste the complete Cookie value into the app's browser Cookie field, keep Cookie mode enabled, and save.
 
-   - 成功：显示“预约成功”。
-   - 失败：显示港大页面返回的信息或网络错误。
-   - Cookie 失效：显示“需要处理”，并提示重新登录。
+The Cookie may include `ASP.NET_SessionId` and authentication cookies. Copy the complete value rather than only one cookie.
 
-5. 点击“设置”可以修改所有配置；点击“−”隐藏到托盘；点击“×”退出。最小化不会停止后台监听。
+Do not send your Cookie, password, or settings file to anyone. The Cookie expires when the session ends or when HKU invalidates it.
 
-6. 预约是否最终成立，仍应以港大 `My Booking Record` 页面为准。预约成功后需要按港大规定到馆签到。
+## Advanced Adaptation
 
-## 配置 Cookie
+The Advanced Adaptation tab is available for changes in the HKU booking page structure. Leave all fields empty for normal use.
 
-推荐方式：
+The app matches seats, time slots, and booking controls automatically. If the page changes, inspect the actual `name` and `value` attributes in the browser developer tools and enter the corresponding seat, slot, and submit fields manually.
 
-1. 在 Microsoft Edge 中打开 `https://booking.lib.hku.hk/` 并手动登录。
-2. 进入要预约的馆区和座位页面，确认页面已能正常显示你的预约权限。
-3. 按 `F12` 打开开发者工具，在“网络”面板刷新页面。
-4. 选择任意一个发往 `booking.lib.hku.hk` 的页面请求，复制请求头中的 `Cookie` 值。
-5. 粘贴到程序设置里的“浏览器 Cookie”，保存。
+The application does not upload pages, Cookies, credentials, or personal information. Version `0.1.0` has no remote logging, crash reporting, email notification, or account synchronization.
 
-不要把 Cookie、密码或配置文件发送给他人。Cookie 失效后，程序会显示“需要处理”，此时按同样步骤更新即可。
+## Input and Output Examples
 
-如果港大页面今后支持普通账号密码表单登录，可取消“仅使用 Cookie”，并填写用户名和密码。若系统使用 HKU 统一身份认证，程序会明确提示改用 Cookie 模式，不会尝试绕过登录。
+### Example Input
 
-## 高级适配
-
-“高级适配”页用于预约网站在学期更新后改变字段名的情况。默认全部留空，程序会按座位号、时段文字和预约按钮自动匹配。若自动识别失效，可从浏览器开发者工具中查看实际 `name/value`，分别填写座位、时段和提交按钮字段。
-
-程序不会上传任何页面、Cookie 或个人信息。当前版本没有日志上传、崩溃上报、邮件或远程通知、账号云同步。
-
-## 输入输出示例
-
-### 输入示例
-
-| 设置项 | 示例 |
+| Setting | Example |
 | --- | --- |
-| 目标馆区 | `Main Library 4/F Study Tables` |
-| 目标座位 | `A-17`；也可留空自动匹配 |
-| 预约时段 | `第 2 时段 13:00–18:00` |
-| 放号时间 | `00:00` |
-| 目标日期偏移 | `1` |
-| 失败重试 | `5` 次，每 `800` 毫秒 |
-| 透明度 | `90%` |
-| Cookie | 浏览器登录港大预约系统后的请求头 Cookie |
+| Target library | `Main Library 4/F Study Tables` |
+| Target seat | `A-17`, or blank for automatic matching |
+| Time slot | Session 2, `13:00-18:00` |
+| Release time | `00:00` |
+| Target date offset | `1` |
+| Retry policy | `5` attempts, `800` ms apart |
+| Opacity | `90%` |
+| Cookie | Cookie value from a signed-in HKU booking session |
 
-### 等待输出示例
+### Waiting Output
+
+The app currently uses a Chinese interface. The following is an English rendering of the status content:
 
 ```text
-等待放号
+Waiting for release
 23:37:13
-放号 11-09 00:00:00 · 到点自动提交
-目标  Main Library 4/F Study Tables · 11-10 Tue · 13:00–18:00 · A-17
-放号 11-09 00:00:00 · 重试 5 次
+Release: 11-09 00:00:00 - automatic submission enabled
+Target: Main Library 4/F Study Tables - 11-10 Tue - 13:00-18:00 - A-17
+Release: 11-09 00:00:00 - 5 retries
 ```
 
-### 成功输出示例
+### Success Output
 
 ```text
-预约成功
-港大预约系统返回预约成功。 · 11-10 13:00–18:00
-目标  Main Library 4/F Study Tables · 11-10 Tue · 13:00–18:00 · A-17
+Booking successful
+HKU returned a successful booking result. - 11-10 13:00-18:00
+Target: Main Library 4/F Study Tables - 11-10 Tue - 13:00-18:00 - A-17
 ```
 
-### 失败输出示例
+### Failure Output
 
 ```text
-预约失败
-目标日期或时段暂未开放，未找到可选座位。
+Booking failed
+The target date or slot is not yet available, or no selectable seat was found.
 ```
 
-实际输出的日期、时段和失败原因取决于港大系统当时返回的页面内容。
+Actual output depends on the page returned by HKU and may not match these examples exactly.
 
-## 项目结构
+## Project Structure
 
 ```text
 hku-library-seat-booking/
-├─ .gitignore
-├─ README.md
-├─ run.ps1
-├─ src/
-│  ├─ Program.cs                 # 悬浮窗、托盘和程序入口
-│  ├─ SettingsForm.cs            # 首次设置与修改设置
-│  ├─ BookingModels.cs           # 配置、时段、预约结果
-│  ├─ ConfigStore.cs             # JSON + DPAPI 本地存储
-│  ├─ ReleaseSchedule.cs         # 放号排程与倒计时
-│  ├─ BookingScheduler.cs        # 常驻监听、校准和重试
-│  ├─ HkuBookingClient.cs        # 港大 HTTP/表单适配
-│  ├─ WebFormParser.cs           # 无第三方依赖的 HTML 表单解析
-│  ├─ AssemblyInfo.cs            # 程序集产品与版权信息
-│  └─ app.manifest
-├─ tests/
-│  ├─ CoreTests.cs
-│  └─ TestProgram.cs
-└─ bin/
-   └─ HkuLibrarySeatBooking.exe
+|-- .gitignore
+|-- LICENSE
+|-- README.md
+|-- run.ps1
+|-- src/
+|   |-- Program.cs
+|   |-- SettingsForm.cs
+|   |-- BookingModels.cs
+|   |-- ConfigStore.cs
+|   |-- ReleaseSchedule.cs
+|   |-- BookingScheduler.cs
+|   |-- HkuBookingClient.cs
+|   |-- WebFormParser.cs
+|   |-- AssemblyInfo.cs
+|   `-- app.manifest
+|-- tests/
+|   |-- CoreTests.cs
+|   `-- TestProgram.cs
+`-- bin/
+    `-- HkuLibrarySeatBooking.exe
 ```
 
-### 必要依赖
+## Required Dependencies
 
-- 操作系统：Windows 10 或 Windows 11。
-- 运行环境：系统自带的 .NET Framework 4.x。
-- 构建环境：系统自带的 `csc.exe` 和 Windows PowerShell。
-- 系统程序集：Windows Forms、System.Drawing、System.Security、System.Runtime.Serialization。
-- 网络：可访问 `booking.lib.hku.hk`，并需要有效的港大登录 Cookie。
-- 第三方包：无。项目不依赖 Node.js、Python、Electron、PyQt 或 NuGet 包。
-- 外部服务：不依赖自建服务器、云数据库、邮件服务或通知服务。
+- Operating system: Windows 10 or Windows 11.
+- Runtime: the .NET Framework 4.x included with Windows.
+- Build tools: Windows PowerShell and the built-in `csc.exe`.
+- System assemblies: Windows Forms, System.Drawing, System.Security, and System.Runtime.Serialization.
+- Network access: access to `booking.lib.hku.hk` and a valid HKU login Cookie.
+- Third-party packages: none.
+- External services: no custom server, cloud database, email service, or notification service.
 
-## 测试范围
+## Testing Scope
 
-自测覆盖工作日/周末时段映射、目标日期、放号宽限窗口、倒计时格式、表单自动识别、下拉框与 WebForms 回发、显式字段覆盖、登录表单、配置边界、敏感字段非明文保存、目标信息摘要，以及一次由本地模拟服务器完成的多步预约流程。
+The automated test suite covers:
 
-真实预约提交需要有效 HKU 登录 Cookie 和实际可预约时段，不能在未授权或没有用户账号的情况下安全验证。首次实际使用时建议先用一个不重要的时段确认页面字段和目标日期，再长期常驻。
+- weekday and weekend slot mapping
+- target-date calculation and the post-release grace window
+- countdown formatting
+- form and select-field detection
+- ASP.NET WebForms postbacks
+- explicit field overrides and login-form parsing
+- configuration boundaries and encrypted secret storage
+- target-summary generation
+- a multi-step booking flow against a local mock server
 
-运行自测不会提交真实预约，也不会把配置发送到外部服务器。
+Current result: `12/12` tests passed.
 
-## 使用边界
+The automated test does not submit a real HKU booking and does not send settings to an external server.
 
-- 仅操作当前用户自己的单个港大账号。
-- 不进行多账号并发、批量抢座、云端同步或远程通知。
-- 预约成功后仍需按港大规定到馆签到；未签到座位可能被系统释放。
-- 使用前请自行确认港大图书馆预约政策及账号使用规定。
+## Limitations and Responsible Use
 
-## 许可证
+- Use the app only with your own single HKU account.
+- Real submissions require a valid HKU session and a target that is available under HKU's current rules.
+- The app does not guarantee seat availability or a successful booking.
+- HKU may change page fields, booking windows, authentication, or availability logic without notice.
+- A successful result must still be checked in HKU `My Booking Record`.
+- Seats may be released if the user does not complete the required on-site check-in.
+- Do not use the project for bulk booking, credential sharing, account automation, or policy violations.
 
-本项目采用 [MIT License](LICENSE)。
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+## Project Status
+
+**The project is still under testing. Seat availability and successful booking are not guaranteed. Use at your own risk and verify every result in the official HKU booking system.**
