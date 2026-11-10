@@ -9,11 +9,103 @@ using System.Threading;
 
 namespace HkuLibrarySeatBooking
 {
+    internal sealed class ServerClockSample
+    {
+        public DateTime ServerUtc { get; set; }
+        public DateTime RequestStartedUtc { get; set; }
+        public DateTime ResponseReceivedUtc { get; set; }
+
+        public TimeSpan RoundTrip
+        {
+            get { return this.ResponseReceivedUtc - this.RequestStartedUtc; }
+        }
+
+        // The server clock is sampled somewhere inside the request/response
+        // interval. Subtracting half the round trip removes the expected
+        // network delay from the clock offset estimate.
+        public TimeSpan Offset
+        {
+            get
+            {
+                return this.ServerUtc.Subtract(this.RequestStartedUtc).Subtract(
+                    TimeSpan.FromTicks(this.RoundTrip.Ticks / 2));
+            }
+        }
+    }
+
+    internal sealed class ServerClockEstimate
+    {
+        public bool HasSamples { get; set; }
+        public TimeSpan Offset { get; set; }
+        public TimeSpan MedianRoundTrip { get; set; }
+        public int SampleCount { get; set; }
+    }
+
+    internal static class ServerClockCalibration
+    {
+        public static ServerClockEstimate Estimate(IEnumerable<ServerClockSample> samples)
+        {
+            List<ServerClockSample> validSamples = new List<ServerClockSample>();
+            if (samples != null)
+            {
+                foreach (ServerClockSample sample in samples)
+                {
+                    if (sample == null || sample.ServerUtc.Year < 2000)
+                    {
+                        continue;
+                    }
+
+                    TimeSpan roundTrip = sample.RoundTrip;
+                    if (roundTrip < TimeSpan.Zero || roundTrip > TimeSpan.FromSeconds(30))
+                    {
+                        continue;
+                    }
+                    validSamples.Add(sample);
+                }
+            }
+
+            if (validSamples.Count == 0)
+            {
+                return new ServerClockEstimate();
+            }
+
+            List<TimeSpan> offsets = new List<TimeSpan>();
+            List<TimeSpan> roundTrips = new List<TimeSpan>();
+            foreach (ServerClockSample sample in validSamples)
+            {
+                offsets.Add(sample.Offset);
+                roundTrips.Add(sample.RoundTrip);
+            }
+            offsets.Sort();
+            roundTrips.Sort();
+
+            return new ServerClockEstimate
+            {
+                HasSamples = true,
+                Offset = Median(offsets),
+                MedianRoundTrip = Median(roundTrips),
+                SampleCount = validSamples.Count
+            };
+        }
+
+        private static TimeSpan Median(IList<TimeSpan> values)
+        {
+            int middle = values.Count / 2;
+            if (values.Count % 2 == 1)
+            {
+                return values[middle];
+            }
+
+            return TimeSpan.FromTicks((values[middle - 1].Ticks + values[middle].Ticks) / 2);
+        }
+    }
+
     internal sealed class PreparedPage
     {
         public string Url { get; set; }
         public string Html { get; set; }
         public DateTime? ServerUtc { get; set; }
+        public ServerClockSample ClockSample { get; set; }
         public DateTime CapturedAtUtc { get; set; }
         public int StatusCode { get; set; }
     }
@@ -25,6 +117,7 @@ namespace HkuLibrarySeatBooking
         public string Content { get; set; }
         public string ContentType { get; set; }
         public DateTime? ServerUtc { get; set; }
+        public ServerClockSample ClockSample { get; set; }
     }
 
     internal sealed class HkuBookingClient : IDisposable
@@ -95,6 +188,7 @@ namespace HkuLibrarySeatBooking
                 Url = response.Url,
                 Html = response.Content,
                 ServerUtc = response.ServerUtc,
+                ClockSample = response.ClockSample,
                 CapturedAtUtc = DateTime.UtcNow,
                 StatusCode = response.StatusCode
             };
@@ -141,7 +235,8 @@ namespace HkuLibrarySeatBooking
 
                     if (!slotActivated &&
                         choice.SlotControl != null &&
-                        choice.SeatControl == null)
+                        choice.SeatControl == null &&
+                        !IsSelectableControl(choice.SlotControl))
                     {
                         response = this.ActivateControl(choice.Form, choice.Fields, choice.SlotControl, cancellationToken);
                         slotActivated = true;
@@ -153,6 +248,7 @@ namespace HkuLibrarySeatBooking
                     }
 
                     if (choice.SeatControl == null &&
+                        !IsSelectableControl(choice.SlotControl) &&
                         string.IsNullOrWhiteSpace(this.config.SeatFieldName))
                     {
                         return BookingResult.Fail(
@@ -163,6 +259,17 @@ namespace HkuLibrarySeatBooking
 
                     response = this.SubmitChoice(choice, 12000, cancellationToken);
                     this.LastResponse = response.Content;
+                    this.UpdatePreparedPage(response);
+
+                    FormChoice confirmation = WebFormParser.BuildNamedSubmitChoice(
+                        this.preparedPage.Html,
+                        "btnSubmitYes");
+                    if (confirmation != null)
+                    {
+                        response = this.SubmitChoice(confirmation, 12000, cancellationToken);
+                        this.LastResponse = response.Content;
+                        this.UpdatePreparedPage(response);
+                    }
                     return InterpretBookingResponse(response);
                 }
 
@@ -205,6 +312,7 @@ namespace HkuLibrarySeatBooking
                 Url = response.Url,
                 Html = response.Content,
                 ServerUtc = response.ServerUtc,
+                ClockSample = response.ClockSample,
                 CapturedAtUtc = DateTime.UtcNow,
                 StatusCode = response.StatusCode
             };
@@ -315,6 +423,10 @@ namespace HkuLibrarySeatBooking
             {
                 requested = "6";
             }
+            else if (this.config.AreaName.IndexOf("Chi Wah", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                requested = "5";
+            }
             else if (this.config.AreaName.IndexOf("Medical", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 requested = "8";
@@ -346,9 +458,17 @@ namespace HkuLibrarySeatBooking
             string requested = GetQueryValue(this.config.BookingPageUrl, "ftype");
             if (string.IsNullOrWhiteSpace(requested))
             {
-                requested = this.config.AreaName.IndexOf("Discussion Room", StringComparison.OrdinalIgnoreCase) >= 0
-                    ? "21"
-                    : "23";
+                if (this.config.AreaName.IndexOf("Chi Wah", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    this.config.AreaName.IndexOf("Study Room", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    requested = "29";
+                }
+                else
+                {
+                    requested = this.config.AreaName.IndexOf("Discussion Room", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? "21"
+                        : "23";
+                }
             }
             foreach (HtmlOption option in select.Options)
             {
@@ -497,7 +617,33 @@ namespace HkuLibrarySeatBooking
 
         private HttpResponseData Get(string url, int timeoutMs, CancellationToken cancellationToken)
         {
-            return this.Request(url, "GET", null, null, timeoutMs, cancellationToken);
+            const int maximumAttempts = 4;
+            for (int attempt = 1; attempt <= maximumAttempts; attempt++)
+            {
+                try
+                {
+                    return this.Request(url, "GET", null, null, timeoutMs, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (WebException)
+                {
+                    if (attempt == maximumAttempts)
+                    {
+                        throw;
+                    }
+
+                    int delayMs = attempt == 1 ? 250 : attempt == 2 ? 600 : 1200;
+                    if (cancellationToken.WaitHandle.WaitOne(delayMs))
+                    {
+                        throw new OperationCanceledException(cancellationToken);
+                    }
+                }
+            }
+
+            throw new InvalidOperationException("GET request retry loop ended unexpectedly.");
         }
 
         private HttpResponseData PostForm(
@@ -543,7 +689,9 @@ namespace HkuLibrarySeatBooking
             request.ReadWriteTimeout = timeoutMs;
             request.KeepAlive = true;
             request.Referer = this.config.BookingPageUrl;
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            // Let Windows Schannel negotiate the best TLS version supported by
+            // both the operating system and the HKU application gateway.
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.SystemDefault;
 
             if (body != null)
             {
@@ -555,21 +703,23 @@ namespace HkuLibrarySeatBooking
                 }
             }
 
+            DateTime requestStartedUtc = DateTime.UtcNow;
             try
             {
                 using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
                 {
-                    return ReadResponse(response);
+                    return ReadResponse(response, requestStartedUtc, DateTime.UtcNow);
                 }
             }
             catch (WebException exception)
             {
+                DateTime responseReceivedUtc = DateTime.UtcNow;
                 HttpWebResponse errorResponse = exception.Response as HttpWebResponse;
                 if (errorResponse != null)
                 {
                     using (errorResponse)
                     {
-                        return ReadResponse(errorResponse);
+                        return ReadResponse(errorResponse, requestStartedUtc, responseReceivedUtc);
                     }
                 }
                 if (exception.Message.IndexOf("redirection", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -582,7 +732,10 @@ namespace HkuLibrarySeatBooking
             }
         }
 
-        private static HttpResponseData ReadResponse(HttpWebResponse response)
+        private static HttpResponseData ReadResponse(
+            HttpWebResponse response,
+            DateTime requestStartedUtc,
+            DateTime responseReceivedUtc)
         {
             string content;
             Encoding encoding = GetEncoding(response.CharacterSet);
@@ -609,7 +762,15 @@ namespace HkuLibrarySeatBooking
                 StatusCode = (int)response.StatusCode,
                 ContentType = response.ContentType,
                 Content = content,
-                ServerUtc = serverTime
+                ServerUtc = serverTime,
+                ClockSample = serverTime.HasValue
+                    ? new ServerClockSample
+                    {
+                        ServerUtc = serverTime.Value,
+                        RequestStartedUtc = requestStartedUtc,
+                        ResponseReceivedUtc = responseReceivedUtc
+                    }
+                    : null
             };
         }
 
@@ -692,6 +853,7 @@ namespace HkuLibrarySeatBooking
                 lowered.Contains("reservation successful") ||
                 lowered.Contains("successfully booked") ||
                 lowered.Contains("your booking is confirmed") ||
+                lowered.Contains("booking is successful") ||
                 text.Contains("預約成功") ||
                 text.Contains("预约成功") ||
                 text.Contains("成功預約") ||
@@ -727,6 +889,17 @@ namespace HkuLibrarySeatBooking
                     : fallback,
                 false,
                 false);
+        }
+
+        private static bool IsSelectableControl(HtmlControl control)
+        {
+            if (control == null)
+            {
+                return false;
+            }
+
+            string type = (control.Type ?? string.Empty).ToLowerInvariant();
+            return type == "checkbox" || type == "radio";
         }
 
         private static string ExtractUsefulMessage(string html, string text)

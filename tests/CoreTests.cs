@@ -21,14 +21,18 @@ namespace HkuLibrarySeatBooking
             RunTest("weekday release and target", TestWeekdayRelease);
             RunTest("post-release grace window", TestReleaseGrace);
             RunTest("weekend slot mapping", TestWeekendSlots);
+            RunTest("law library second slot mapping", TestLawLibrarySecondSlot);
+            RunTest("chi wah hourly slot mapping", TestChiWahHourlySlots);
             RunTest("countdown format", TestCountdownFormat);
             RunTest("form auto-detection", TestFormDetection);
             RunTest("explicit form overrides", TestExplicitOverrides);
             RunTest("select options and postback link", TestSelectAndPostback);
             RunTest("login form detection", TestLoginForm);
+            RunTest("booking confirmation button detection", TestBookingConfirmationButton);
             RunTest("config normalization", TestConfigNormalization);
             RunTest("config persistence protects secrets", TestConfigPersistence);
             RunTest("target summary", TestTargetSummary);
+            RunTest("multi-sample server clock calibration", TestServerClockCalibration);
             RunTest("multi-step ASP.NET booking flow", TestMultiStepBookingFlow);
 
             StringBuilder report = new StringBuilder();
@@ -86,6 +90,48 @@ namespace HkuLibrarySeatBooking
             BookingSlot unavailable = BookingSlots.Resolve(config, new DateTime(2026, 11, 15));
             Equal("13:00", unavailable.StartText, "weekend falls back to slot 2");
             Equal("17:00", unavailable.EndText, "weekend slot 2 end");
+        }
+
+        private static void TestLawLibrarySecondSlot()
+        {
+            BookingConfig config = BookingConfig.CreateDefault();
+            config.AreaName = "Law Library Study Tables";
+            config.ReleaseTime = "18:00";
+            config.TargetDayOffset = 1;
+            config.TimeSlotIndex = 1;
+            BookingAttempt attempt = ReleaseSchedule.Plan(
+                config,
+                new DateTime(2026, 11, 10, 12, 0, 0));
+
+            Equal("Law Library Study Tables", config.AreaName, "law library area");
+            Equal(new DateTime(2026, 11, 11), attempt.TargetDate, "next-day target");
+            Equal("13:00", attempt.Slot.StartText, "law library second slot start");
+            Equal("18:00", attempt.Slot.EndText, "law library second slot end");
+
+            config.TimeSlotIndex = 0;
+            BookingSlot first = BookingSlots.Resolve(config, attempt.TargetDate);
+            Equal("09:00", first.StartText, "law library first slot start");
+            Equal("13:00", first.EndText, "law library first slot end");
+
+            config.TimeSlotIndex = 2;
+            BookingSlot third = BookingSlots.Resolve(config, attempt.TargetDate);
+            Equal("18:00", third.StartText, "law library third slot start");
+            Equal("21:00", third.EndText, "law library third slot end");
+        }
+
+        private static void TestChiWahHourlySlots()
+        {
+            BookingConfig config = BookingConfig.CreateDefault();
+            config.AreaName = "Chi Wah Learning Commons Study Rooms";
+            config.TimeSlotIndex = 11;
+            BookingSlot slot = BookingSlots.Resolve(config, new DateTime(2026, 11, 13));
+            Equal("13:00", slot.StartText, "chi wah hourly slot start");
+            Equal("14:00", slot.EndText, "chi wah hourly slot end");
+
+            string[] names = BookingSlots.NamesForArea(config.AreaName);
+            Equal(23, names.Length, "chi wah preset count including custom");
+            True(BookingSlots.IsCustom(config.AreaName, 22), "chi wah custom index");
+            False(BookingSlots.IsCustom("Law Library Study Tables", 2), "law library third slot is preset");
         }
 
         private static void TestReleaseGrace()
@@ -239,6 +285,23 @@ namespace HkuLibrarySeatBooking
             Equal("00:00", config.ReleaseTime, "invalid clock fallback");
         }
 
+        private static void TestBookingConfirmationButton()
+        {
+            const string html = @"
+<form method='post' action='/Secure/NewBooking.aspx?library=5&amp;ftype=29'>
+<input type='hidden' name='__VIEWSTATE' value='state'>
+<input type='hidden' name='__EVENTVALIDATION' value='validation'>
+<input type='submit' name='ctl00$main$btnSubmitYes' value='Yes'>
+<input type='submit' name='ctl00$main$btnSubmitNo' value='No'>
+</form>";
+            FormChoice choice = WebFormParser.BuildNamedSubmitChoice(html, "btnSubmitYes");
+            NotNull(choice, "confirmation choice");
+            Equal("Yes", choice.Fields["ctl00$main$btnSubmitYes"], "confirmation button value");
+            True(
+                !choice.Fields.ContainsKey("ctl00$main$btnSubmitNo"),
+                "negative confirmation button must not be submitted");
+        }
+
         private static void TestConfigPersistence()
         {
             string directory = Path.Combine(Path.GetTempPath(), "hku-seat-tests-" + Guid.NewGuid().ToString("N"));
@@ -282,6 +345,42 @@ namespace HkuLibrarySeatBooking
             True(text.Contains("08:30"), "slot in target");
         }
 
+        private static void TestServerClockCalibration()
+        {
+            DateTime localStart = new DateTime(2026, 11, 10, 10, 0, 0, DateTimeKind.Utc);
+            ServerClockEstimate estimate = ServerClockCalibration.Estimate(new[]
+            {
+                new ServerClockSample
+                {
+                    RequestStartedUtc = localStart,
+                    ResponseReceivedUtc = localStart.AddMilliseconds(200),
+                    ServerUtc = localStart.AddMilliseconds(2100)
+                },
+                new ServerClockSample
+                {
+                    RequestStartedUtc = localStart.AddSeconds(1),
+                    ResponseReceivedUtc = localStart.AddMilliseconds(1300),
+                    ServerUtc = localStart.AddMilliseconds(3150)
+                },
+                new ServerClockSample
+                {
+                    RequestStartedUtc = localStart.AddSeconds(2),
+                    ResponseReceivedUtc = localStart.AddMilliseconds(2100),
+                    ServerUtc = localStart.AddMilliseconds(4050)
+                }
+            });
+
+            True(estimate.HasSamples, "clock estimate should have samples");
+            Equal(3, estimate.SampleCount, "clock sample count");
+            True(
+                Math.Abs(estimate.Offset.TotalMilliseconds - 2000) <= 1,
+                "median offset should account for half round-trip delay");
+            True(
+                estimate.MedianRoundTrip >= TimeSpan.FromMilliseconds(100) &&
+                estimate.MedianRoundTrip <= TimeSpan.FromMilliseconds(300),
+                "median round-trip should be reported");
+        }
+
         private static void TestMultiStepBookingFlow()
         {
             using (MockBookingServer server = new MockBookingServer())
@@ -304,7 +403,8 @@ namespace HkuLibrarySeatBooking
 
                 using (HkuBookingClient client = new HkuBookingClient(config, string.Empty, string.Empty))
                 {
-                    client.Prepare(config.BookingPageUrl, CancellationToken.None);
+                    PreparedPage page = client.Prepare(config.BookingPageUrl, CancellationToken.None);
+                    NotNull(page.ClockSample, "prepared page clock sample");
                     BookingResult result = client.Submit(attempt, CancellationToken.None);
                     True(result.Success, "booking result should be success: " + result.Message);
                 }

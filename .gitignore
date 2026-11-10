@@ -1,5 +1,6 @@
 # Local runtime configuration and secrets
 settings.json
+*.har
 *.tmp
 *.log
 

@@ -18,6 +18,8 @@ namespace HkuLibrarySeatBooking
         private readonly CheckBox cookieOnlyBox;
         private readonly TextBox seatBox;
         private readonly ComboBox slotCombo;
+        private readonly Label slotTimeLabel;
+        private readonly Panel customPanel;
         private readonly TextBox customStartBox;
         private readonly TextBox customEndBox;
         private readonly DateTimePicker releaseTimePicker;
@@ -104,12 +106,28 @@ namespace HkuLibrarySeatBooking
 
             AddSection(basic, "座位与时段", ref y);
             this.seatBox = AddTextBox(basic, "目标座位（留空=自动匹配）", ref y, false);
-            this.slotCombo = AddCombo(basic, "预约时段", BookingSlots.Names, ref y, true);
+            this.slotCombo = AddCombo(
+                basic,
+                "预约时段",
+                BookingSlots.NamesForArea(config.AreaName),
+                ref y,
+                true);
             this.slotCombo.SelectedIndexChanged += this.SlotChanged;
-            Panel customPanel = new Panel
+            this.slotTimeLabel = new Label
             {
                 Location = new Point(150, y),
-                Size = new Size(345, 30)
+                Size = new Size(345, 25),
+                TextAlign = ContentAlignment.MiddleLeft,
+                BackColor = Color.FromArgb(239, 245, 243),
+                ForeColor = Color.FromArgb(20, 113, 92),
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold)
+            };
+            basic.Controls.Add(this.slotTimeLabel);
+            this.customPanel = new Panel
+            {
+                Location = new Point(150, y),
+                Size = new Size(345, 30),
+                Visible = false
             };
             this.customStartBox = new TextBox
             {
@@ -123,15 +141,17 @@ namespace HkuLibrarySeatBooking
                 Width = 74,
                 Text = config.CustomEndTime
             };
-            customPanel.Controls.Add(this.customStartBox);
-            customPanel.Controls.Add(new Label { Text = "至", Location = new Point(82, 4), AutoSize = true });
-            customPanel.Controls.Add(this.customEndBox);
-            basic.Controls.Add(customPanel);
+            this.customPanel.Controls.Add(this.customStartBox);
+            this.customPanel.Controls.Add(new Label { Text = "至", Location = new Point(82, 4), AutoSize = true });
+            this.customPanel.Controls.Add(this.customEndBox);
+            basic.Controls.Add(this.customPanel);
             y += 42;
 
             AddSection(basic, "放号与重试", ref y);
             this.releaseTimePicker = AddTimePicker(basic, "每天放号时间", ref y);
             this.targetOffsetBox = AddNumber(basic, "目标日期（放号后第几天）", 0, 7, ref y);
+            this.releaseTimePicker.ValueChanged += this.SlotChanged;
+            this.targetOffsetBox.ValueChanged += this.SlotChanged;
             this.retryCountBox = AddNumber(basic, "失败自动重试次数", 0, 50, ref y);
             this.retryIntervalBox = AddNumber(basic, "重试间隔（毫秒）", 100, 60000, 100, ref y);
             this.opacityBox = AddNumber(basic, "窗口透明度（%）", 35, 100, ref y);
@@ -197,7 +217,7 @@ namespace HkuLibrarySeatBooking
             this.cookieBox.Text = cookie ?? string.Empty;
             this.cookieOnlyBox.Checked = config.UseCookieOnly;
             this.seatBox.Text = config.SeatLabel ?? string.Empty;
-            this.slotCombo.SelectedIndex = Math.Max(0, Math.Min(config.TimeSlotIndex, 3));
+            this.SetSlotChoices(config.TimeSlotIndex);
             this.customStartBox.Text = config.CustomStartTime;
             this.customEndBox.Text = config.CustomEndTime;
 
@@ -231,13 +251,34 @@ namespace HkuLibrarySeatBooking
             {
                 this.areaUrlBox.Text = preset.Url;
             }
+            this.SetSlotChoices(0);
         }
 
         private void SlotChanged(object sender, EventArgs e)
         {
-            bool custom = this.slotCombo.SelectedIndex == 3;
+            if (this.slotCombo.SelectedIndex < 0)
+            {
+                return;
+            }
+
+            bool custom = BookingSlots.IsCustom(
+                this.areaCombo.Text,
+                this.slotCombo.SelectedIndex);
             this.customStartBox.Enabled = custom;
             this.customEndBox.Enabled = custom;
+            this.customPanel.Visible = custom;
+            this.slotTimeLabel.Visible = !custom;
+            if (!custom)
+            {
+                BookingConfig preview = this.original.Clone();
+                preview.TimeSlotIndex = this.slotCombo.SelectedIndex;
+                preview.ReleaseTime = this.releaseTimePicker.Value.ToString("HH:mm");
+                preview.TargetDayOffset = (int)this.targetOffsetBox.Value;
+                BookingAttempt attempt = ReleaseSchedule.Plan(preview, DateTime.Now);
+                this.slotTimeLabel.Text =
+                    attempt.Slot.Name + "：" + attempt.Slot.StartText + "–" +
+                    attempt.Slot.EndText + "（自动）";
+            }
         }
 
         private void ToggleSecrets(object sender, EventArgs e)
@@ -290,7 +331,7 @@ namespace HkuLibrarySeatBooking
                 {
                     throw new FormatException("请填写 HKU 用户名和密码，或切换为 Cookie 模式。");
                 }
-                if (config.TimeSlotIndex == 3)
+                if (BookingSlots.IsCustom(config.AreaName, config.TimeSlotIndex))
                 {
                     BookingSlots.Create("自定义时段", config.CustomStartTime, config.CustomEndTime);
                 }
@@ -307,6 +348,24 @@ namespace HkuLibrarySeatBooking
             {
                 MessageBox.Show(this, exception.Message, "无法保存", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+        }
+
+        private void SetSlotChoices(int desiredIndex)
+        {
+            string[] names = BookingSlots.NamesForArea(this.areaCombo.Text);
+            int safeIndex = Math.Max(0, Math.Min(desiredIndex, names.Length - 1));
+            this.slotCombo.BeginUpdate();
+            try
+            {
+                this.slotCombo.Items.Clear();
+                this.slotCombo.Items.AddRange(names);
+                this.slotCombo.SelectedIndex = safeIndex;
+            }
+            finally
+            {
+                this.slotCombo.EndUpdate();
+            }
+            this.SlotChanged(this, EventArgs.Empty);
         }
 
         private static void AddSection(Control parent, string text, ref int y)
