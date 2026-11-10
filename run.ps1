@@ -28,6 +28,7 @@ if (-not (Test-Path $compiler)) {
 $appSources = @(Get-ChildItem -Path (Join-Path $sourceRoot "*.cs") | Select-Object -ExpandProperty FullName)
 $coreSourceNames = @(
     "BookingModels.cs",
+    "BookingHarRecorder.cs",
     "BookingScheduler.cs",
     "ConfigStore.cs",
     "HkuBookingClient.cs",

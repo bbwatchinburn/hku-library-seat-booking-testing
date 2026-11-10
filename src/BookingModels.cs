@@ -421,6 +421,27 @@ namespace HkuLibrarySeatBooking
         public bool IsCustom { get; set; }
     }
 
+    internal static class BookingRetryPolicy
+    {
+        public static int PreparationDelayMilliseconds(DateTime now, DateTime releaseAt)
+        {
+            TimeSpan elapsed = now - releaseAt;
+            if (elapsed < TimeSpan.Zero)
+            {
+                return 500;
+            }
+            if (elapsed < TimeSpan.FromSeconds(5))
+            {
+                return 200;
+            }
+            if (elapsed < TimeSpan.FromSeconds(30))
+            {
+                return 500;
+            }
+            return 1000;
+        }
+    }
+
     internal enum RunState
     {
         Waiting,
@@ -444,6 +465,7 @@ namespace HkuLibrarySeatBooking
         public bool Success { get; set; }
         public bool AuthenticationRequired { get; set; }
         public bool Retryable { get; set; }
+        public bool ConnectionFailure { get; set; }
         public string Message { get; set; }
         public string RawResponse { get; set; }
 
@@ -457,13 +479,18 @@ namespace HkuLibrarySeatBooking
             };
         }
 
-        public static BookingResult Fail(string message, bool retryable, bool authenticationRequired)
+        public static BookingResult Fail(
+            string message,
+            bool retryable,
+            bool authenticationRequired,
+            bool connectionFailure = false)
         {
             return new BookingResult
             {
                 Success = false,
                 Retryable = retryable,
                 AuthenticationRequired = authenticationRequired,
+                ConnectionFailure = connectionFailure,
                 Message = message
             };
         }

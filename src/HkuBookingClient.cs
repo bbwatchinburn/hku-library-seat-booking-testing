@@ -129,12 +129,23 @@ namespace HkuLibrarySeatBooking
         private readonly BookingConfig config;
         private readonly string password;
         private readonly CookieContainer cookies;
+        private readonly BookingHarRecorder recorder;
         private PreparedPage preparedPage;
 
         public HkuBookingClient(BookingConfig config, string password, string cookieHeader)
+            : this(config, password, cookieHeader, null)
+        {
+        }
+
+        public HkuBookingClient(
+            BookingConfig config,
+            string password,
+            string cookieHeader,
+            BookingHarRecorder recorder)
         {
             this.config = config;
             this.password = password ?? string.Empty;
+            this.recorder = recorder;
             this.cookies = new CookieContainer();
             this.LoadCookieHeader(cookieHeader);
         }
@@ -195,6 +206,18 @@ namespace HkuLibrarySeatBooking
             return this.preparedPage;
         }
 
+        public ServerClockSample SampleServerClock(
+            string areaUrl,
+            CancellationToken cancellationToken)
+        {
+            HttpResponseData response = this.GetWithMethod(
+                areaUrl,
+                "HEAD",
+                15000,
+                cancellationToken);
+            return response.ClockSample;
+        }
+
         public BookingResult Submit(BookingAttempt attempt, CancellationToken cancellationToken)
         {
             try
@@ -204,7 +227,8 @@ namespace HkuLibrarySeatBooking
                     this.Prepare(this.config.BookingPageUrl, cancellationToken);
                 }
 
-                if (DateTime.UtcNow - this.preparedPage.CapturedAtUtc > TimeSpan.FromSeconds(3))
+                if (DateTime.UtcNow - this.preparedPage.CapturedAtUtc > TimeSpan.FromSeconds(30) ||
+                    !this.HasTargetDateOption(attempt))
                 {
                     this.Prepare(this.config.BookingPageUrl, cancellationToken);
                 }
@@ -295,13 +319,18 @@ namespace HkuLibrarySeatBooking
                 return BookingResult.Fail(
                     "提交预约时发生网络错误：" + exception.Message,
                     true,
-                    false);
+                    false,
+                    true);
             }
         }
 
         public void Dispose()
         {
             this.preparedPage = null;
+            if (this.recorder != null)
+            {
+                this.recorder.Save();
+            }
         }
 
         private void UpdatePreparedPage(HttpResponseData response)
@@ -316,6 +345,28 @@ namespace HkuLibrarySeatBooking
                 CapturedAtUtc = DateTime.UtcNow,
                 StatusCode = response.StatusCode
             };
+        }
+
+        private bool HasTargetDateOption(BookingAttempt attempt)
+        {
+            string targetDate = attempt.TargetDate.ToString("yyyy-MM-dd");
+            foreach (HtmlForm form in WebFormParser.ParseForms(this.preparedPage.Html))
+            {
+                HtmlControl dateSelect = WebFormParser.FindSelectBySuffix(form, "ddlView");
+                if (dateSelect == null)
+                {
+                    continue;
+                }
+
+                foreach (HtmlOption option in dateSelect.Options)
+                {
+                    if (string.Equals(option.Value, targetDate, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         private bool TrySearchTarget(
@@ -617,12 +668,28 @@ namespace HkuLibrarySeatBooking
 
         private HttpResponseData Get(string url, int timeoutMs, CancellationToken cancellationToken)
         {
+            return this.GetWithMethod(url, "GET", timeoutMs, cancellationToken);
+        }
+
+        private HttpResponseData GetWithMethod(
+            string url,
+            string method,
+            int timeoutMs,
+            CancellationToken cancellationToken)
+        {
             const int maximumAttempts = 4;
             for (int attempt = 1; attempt <= maximumAttempts; attempt++)
             {
                 try
                 {
-                    return this.Request(url, "GET", null, null, timeoutMs, cancellationToken);
+                    return this.Request(
+                        url,
+                        method,
+                        null,
+                        null,
+                        timeoutMs,
+                        cancellationToken,
+                        attempt == 1);
                 }
                 catch (OperationCanceledException)
                 {
@@ -643,7 +710,7 @@ namespace HkuLibrarySeatBooking
                 }
             }
 
-            throw new InvalidOperationException("GET request retry loop ended unexpectedly.");
+            throw new InvalidOperationException("HTTP request retry loop ended unexpectedly.");
         }
 
         private HttpResponseData PostForm(
@@ -667,7 +734,8 @@ namespace HkuLibrarySeatBooking
             byte[] body,
             string contentType,
             int timeoutMs,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            bool keepAlive = true)
         {
             cancellationToken.ThrowIfCancellationRequested();
             Uri uri;
@@ -687,7 +755,7 @@ namespace HkuLibrarySeatBooking
             request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
             request.Timeout = timeoutMs;
             request.ReadWriteTimeout = timeoutMs;
-            request.KeepAlive = true;
+            request.KeepAlive = keepAlive;
             request.Referer = this.config.BookingPageUrl;
             // Let Windows Schannel negotiate the best TLS version supported by
             // both the operating system and the HKU application gateway.
@@ -704,11 +772,30 @@ namespace HkuLibrarySeatBooking
             }
 
             DateTime requestStartedUtc = DateTime.UtcNow;
+            string requestBodyText = body == null ? null : Encoding.UTF8.GetString(body);
+            CookieCollection requestCookies = this.cookies.GetCookies(uri);
             try
             {
                 using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
                 {
-                    return ReadResponse(response, requestStartedUtc, DateTime.UtcNow);
+                    HttpResponseData responseData = ReadResponse(
+                        response,
+                        requestStartedUtc,
+                        DateTime.UtcNow);
+                    if (this.recorder != null)
+                    {
+                        this.recorder.RecordSuccess(
+                            method,
+                            url,
+                            requestStartedUtc,
+                            DateTime.UtcNow,
+                            request.ContentType,
+                            requestBodyText,
+                            requestCookies,
+                            response,
+                            responseData);
+                    }
+                    return responseData;
                 }
             }
             catch (WebException exception)
@@ -719,8 +806,40 @@ namespace HkuLibrarySeatBooking
                 {
                     using (errorResponse)
                     {
-                        return ReadResponse(errorResponse, requestStartedUtc, responseReceivedUtc);
+                        HttpResponseData errorData = ReadResponse(
+                            errorResponse,
+                            requestStartedUtc,
+                            responseReceivedUtc);
+                        if (this.recorder != null)
+                        {
+                            this.recorder.RecordFailure(
+                                method,
+                                url,
+                                requestStartedUtc,
+                                responseReceivedUtc,
+                                request.ContentType,
+                                requestBodyText,
+                                requestCookies,
+                                errorResponse,
+                                errorData,
+                                exception);
+                        }
+                        return errorData;
                     }
+                }
+                if (this.recorder != null)
+                {
+                    this.recorder.RecordFailure(
+                        method,
+                        url,
+                        requestStartedUtc,
+                        responseReceivedUtc,
+                        request.ContentType,
+                        requestBodyText,
+                        requestCookies,
+                        null,
+                        null,
+                        exception);
                 }
                 if (exception.Message.IndexOf("redirection", StringComparison.OrdinalIgnoreCase) >= 0 ||
                     exception.Message.IndexOf("redirect", StringComparison.OrdinalIgnoreCase) >= 0)

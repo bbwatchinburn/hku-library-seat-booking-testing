@@ -1,6 +1,7 @@
 using System;
 using System.Drawing;
 using System.Linq;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace HkuLibrarySeatBooking
@@ -16,6 +17,8 @@ namespace HkuLibrarySeatBooking
         private readonly TextBox passwordBox;
         private readonly TextBox cookieBox;
         private readonly CheckBox cookieOnlyBox;
+        private readonly Button edgeLoginButton;
+        private readonly Label edgeLoginStatus;
         private readonly TextBox seatBox;
         private readonly ComboBox slotCombo;
         private readonly Label slotTimeLabel;
@@ -37,6 +40,8 @@ namespace HkuLibrarySeatBooking
         private readonly TextBox submitFieldNameBox;
         private readonly TextBox submitFieldValueBox;
         private readonly CheckBox showSecretsBox;
+        private CancellationTokenSource edgeLoginCancellation;
+        private Thread edgeLoginThread;
 
         public SettingsForm(ConfigStore store, BookingConfig config, string password, string cookie, bool firstRun)
         {
@@ -103,6 +108,28 @@ namespace HkuLibrarySeatBooking
             this.cookieOnlyBox = AddCheckBox(basic, "仅使用 Cookie（推荐，兼容 HKU 单点登录）", ref y);
             this.showSecretsBox = AddCheckBox(basic, "临时显示密码和 Cookie", ref y);
             this.showSecretsBox.CheckedChanged += this.ToggleSecrets;
+            this.edgeLoginButton = new Button
+            {
+                Text = "通过 Edge 登录并自动导入会话",
+                Location = new Point(150, y),
+                Size = new Size(345, 30),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.White,
+                ForeColor = Color.FromArgb(20, 113, 92)
+            };
+            this.edgeLoginButton.FlatAppearance.BorderColor = Color.FromArgb(20, 113, 92);
+            this.edgeLoginButton.Click += this.EdgeLoginClicked;
+            basic.Controls.Add(this.edgeLoginButton);
+            y += 34;
+            this.edgeLoginStatus = new Label
+            {
+                Text = "无需手动复制 Cookie；程序不保存 HKU 密码。",
+                Location = new Point(150, y),
+                Size = new Size(345, 30),
+                ForeColor = Color.FromArgb(92, 103, 117)
+            };
+            basic.Controls.Add(this.edgeLoginStatus);
+            y += 32;
 
             AddSection(basic, "座位与时段", ref y);
             this.seatBox = AddTextBox(basic, "目标座位（留空=自动匹配）", ref y, false);
@@ -286,6 +313,108 @@ namespace HkuLibrarySeatBooking
             char mask = this.showSecretsBox.Checked ? '\0' : '●';
             this.passwordBox.PasswordChar = mask;
             this.cookieBox.PasswordChar = mask;
+        }
+
+        private void EdgeLoginClicked(object sender, EventArgs e)
+        {
+            if (this.edgeLoginThread != null && this.edgeLoginThread.IsAlive)
+            {
+                return;
+            }
+
+            this.edgeLoginButton.Enabled = false;
+            this.edgeLoginStatus.Text = "正在启动专用 Edge 登录窗口...";
+            this.edgeLoginCancellation = new CancellationTokenSource();
+            CancellationToken token = this.edgeLoginCancellation.Token;
+            this.edgeLoginThread = new Thread(() => this.RunEdgeLogin(token));
+            this.edgeLoginThread.IsBackground = true;
+            this.edgeLoginThread.Name = "HKU Edge session import";
+            this.edgeLoginThread.Start();
+        }
+
+        private void RunEdgeLogin(CancellationToken cancellationToken)
+        {
+            try
+            {
+                string cookie = EdgeSessionLogin.LoginAndCaptureCookie(
+                    status => this.SetEdgeLoginStatus(status),
+                    cancellationToken);
+                this.SetEdgeLoginResult(cookie, null);
+            }
+            catch (OperationCanceledException)
+            {
+                this.SetEdgeLoginStatus("已取消浏览器登录。");
+            }
+            catch (Exception exception)
+            {
+                this.SetEdgeLoginResult(null, exception.Message);
+            }
+        }
+
+        private void SetEdgeLoginStatus(string text)
+        {
+            if (this.IsDisposed || !this.IsHandleCreated)
+            {
+                return;
+            }
+            try
+            {
+                this.BeginInvoke(new Action(() => this.ApplyEdgeLoginStatus(text)));
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        private void ApplyEdgeLoginStatus(string text)
+        {
+            if (this.IsDisposed)
+            {
+                return;
+            }
+            this.edgeLoginStatus.Text = text;
+        }
+
+        private void SetEdgeLoginResult(string cookie, string error)
+        {
+            if (this.IsDisposed || !this.IsHandleCreated)
+            {
+                return;
+            }
+            try
+            {
+                this.BeginInvoke(new Action(() =>
+                {
+                    if (!string.IsNullOrWhiteSpace(cookie))
+                    {
+                        this.cookieBox.Text = cookie;
+                        this.cookieOnlyBox.Checked = true;
+                        this.edgeLoginStatus.Text = "登录会话已导入，请点击“保存并开始监听”。";
+                    }
+                    else
+                    {
+                        this.edgeLoginStatus.Text = "登录失败：" + error;
+                    }
+                    this.edgeLoginButton.Enabled = true;
+                    if (this.edgeLoginCancellation != null)
+                    {
+                        this.edgeLoginCancellation.Dispose();
+                        this.edgeLoginCancellation = null;
+                    }
+                }));
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            if (this.edgeLoginCancellation != null)
+            {
+                this.edgeLoginCancellation.Cancel();
+            }
+            base.OnFormClosed(e);
         }
 
         private void SaveClicked(object sender, EventArgs e)

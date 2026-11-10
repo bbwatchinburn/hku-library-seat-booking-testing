@@ -84,106 +84,179 @@ namespace HkuLibrarySeatBooking
                         FriendlyState.Title(RunState.Waiting),
                         "下一次放号 " + attempt.ReleaseAt.ToString("MM-dd HH:mm") + "，目标 " + attempt.TargetDate.ToString("MM-dd ddd")));
 
-                    DateTime prepareAt = attempt.ReleaseAt.AddSeconds(-20);
-                    if (!this.WaitUntil(prepareAt, cancellationToken))
+                    DateTime recordingStartAt = attempt.ReleaseAt.AddMinutes(-2);
+                    if (DateTime.Now < recordingStartAt &&
+                        !this.WaitUntil(recordingStartAt, cancellationToken))
                     {
                         return;
                     }
 
-                    this.Publish(StatusSnapshot.Create(
-                        RunState.Preparing,
-                        FriendlyState.Title(RunState.Preparing),
-                        "正在获取预约页面并同步服务器时间"));
-
-                    DateTime effectiveRelease = attempt.ReleaseAt;
-                    ServerClockEstimate clockEstimate = new ServerClockEstimate();
-                    using (HkuBookingClient client = new HkuBookingClient(config, password, cookie))
+                    using (BookingHarRecorder recorder = new BookingHarRecorder(attempt.ReleaseAt))
                     {
-                        try
+                        DateTime prepareAt = attempt.ReleaseAt.AddSeconds(-20);
+                        if (!this.WaitUntil(prepareAt, cancellationToken))
                         {
-                            List<ServerClockSample> clockSamples = new List<ServerClockSample>();
-                            PreparedPage page = null;
-                            for (int sampleIndex = 0; sampleIndex < ClockSampleCount; sampleIndex++)
+                            return;
+                        }
+
+                        this.Publish(StatusSnapshot.Create(
+                            RunState.Preparing,
+                            FriendlyState.Title(RunState.Preparing),
+                            "正在获取预约页面并同步服务器时间 · HAR 记录已开启"));
+
+                        DateTime effectiveRelease = attempt.ReleaseAt;
+                        ServerClockEstimate clockEstimate = new ServerClockEstimate();
+                        using (HkuBookingClient client = new HkuBookingClient(
+                            config,
+                            password,
+                            cookie,
+                            recorder))
+                        {
+                            try
                             {
+                                List<ServerClockSample> clockSamples = new List<ServerClockSample>();
+                                PreparedPage page = null;
+                                DateTime preparationDeadline = attempt.ReleaseAt.AddMinutes(2);
+                                int preparationFailures = 0;
+                                while (!cancellationToken.IsCancellationRequested)
+                                {
+                                if (page != null && DateTime.Now >= attempt.ReleaseAt)
+                                {
+                                    break;
+                                }
+
                                 try
                                 {
-                                    page = client.Prepare(config.BookingPageUrl, cancellationToken);
+                                    if (page == null)
+                                    {
+                                        page = client.Prepare(config.BookingPageUrl, cancellationToken);
+                                    }
+                                    else
+                                    {
+                                        ServerClockSample sample = client.SampleServerClock(
+                                            config.BookingPageUrl,
+                                            cancellationToken);
+                                        if (sample != null)
+                                        {
+                                            clockSamples.Add(sample);
+                                        }
+                                    }
                                 }
                                 catch (BookingAuthenticationException)
                                 {
                                     throw;
                                 }
-                                catch
+                                catch (Exception exception)
                                 {
-                                    if (clockSamples.Count == 0)
+                                    preparationFailures++;
+                                    if (DateTime.Now >= preparationDeadline)
                                     {
                                         throw;
                                     }
-                                    break;
+
+                                    this.Publish(StatusSnapshot.Create(
+                                        RunState.Retrying,
+                                        "准备预约页面",
+                                        "页面连接中断，稍后重试（第 " +
+                                        preparationFailures + " 次）：" + exception.Message));
+                                    int retryDelayMs = BookingRetryPolicy.PreparationDelayMilliseconds(
+                                        DateTime.Now,
+                                        attempt.ReleaseAt);
+                                    if (!this.Wait(retryDelayMs, cancellationToken))
+                                    {
+                                        return;
+                                    }
+                                    continue;
                                 }
 
-                                if (page.ClockSample != null)
+                                if (page.ClockSample != null && clockSamples.Count == 0)
                                 {
                                     clockSamples.Add(page.ClockSample);
                                 }
 
-                                if (sampleIndex + 1 < ClockSampleCount &&
-                                    !this.Wait(ClockSampleIntervalMs, cancellationToken))
+                                if (clockSamples.Count >= ClockSampleCount ||
+                                    DateTime.Now >= attempt.ReleaseAt)
+                                {
+                                    break;
+                                }
+
+                                    if (!this.Wait(ClockSampleIntervalMs, cancellationToken))
+                                    {
+                                        return;
+                                    }
+                                }
+
+                                clockEstimate = ServerClockCalibration.Estimate(clockSamples);
+                                if (clockEstimate.HasSamples)
+                                {
+                                    effectiveRelease = attempt.ReleaseAt.Subtract(clockEstimate.Offset);
+                                }
+
+                                DateTime boundaryRefreshAt = effectiveRelease.AddMilliseconds(-500);
+                                if (DateTime.Now < boundaryRefreshAt &&
+                                    !this.WaitUntil(boundaryRefreshAt, cancellationToken))
                                 {
                                     return;
                                 }
+                                try
+                                {
+                                    client.Prepare(config.BookingPageUrl, cancellationToken);
+                                }
+                                catch (BookingAuthenticationException)
+                                {
+                                    throw;
+                                }
+                                catch (Exception exception)
+                                {
+                                    this.Publish(StatusSnapshot.Create(
+                                        RunState.Retrying,
+                                        "准备预约页面",
+                                        "放号前预刷新失败，提交阶段将继续尝试：" +
+                                        exception.Message));
+                                }
                             }
-
-                            clockEstimate = ServerClockCalibration.Estimate(clockSamples);
-                            if (clockEstimate.HasSamples)
+                            catch (BookingAuthenticationException exception)
                             {
-                                effectiveRelease = attempt.ReleaseAt.Subtract(clockEstimate.Offset);
+                                this.Publish(StatusSnapshot.Create(
+                                    RunState.NeedsAttention,
+                                    FriendlyState.Title(RunState.NeedsAttention),
+                                    exception.Message));
+                                continue;
                             }
-                        }
-                        catch (BookingAuthenticationException exception)
-                        {
-                            this.Publish(StatusSnapshot.Create(
-                                RunState.NeedsAttention,
-                                FriendlyState.Title(RunState.NeedsAttention),
-                                exception.Message));
-                            this.WaitAfterCompletedAttempt(attempt, cancellationToken);
-                            continue;
-                        }
-                        catch (Exception exception)
-                        {
-                            this.Publish(StatusSnapshot.Create(
-                                RunState.Failed,
-                                "准备预约页面失败",
-                                exception.Message));
-                            this.WaitAfterCompletedAttempt(attempt, cancellationToken);
-                            continue;
-                        }
+                            catch (Exception exception)
+                            {
+                                this.Publish(StatusSnapshot.Create(
+                                    RunState.Failed,
+                                    "准备预约页面失败",
+                                    exception.Message));
+                                continue;
+                            }
 
-                        this.Publish(StatusSnapshot.Create(
-                            RunState.Submitting,
-                            FriendlyState.Title(RunState.Submitting),
-                            this.FormatClockReadiness(clockEstimate)));
-                        if (!this.WaitUntil(effectiveRelease, cancellationToken))
-                        {
-                            return;
-                        }
-                        DateTime serverWindowNow = clockEstimate.HasSamples
-                            ? DateTime.Now.Add(clockEstimate.Offset)
-                            : DateTime.Now;
-                        if (serverWindowNow > attempt.ReleaseAt.AddMinutes(2))
-                        {
                             this.Publish(StatusSnapshot.Create(
-                                RunState.Failed,
-                                "已错过本次放号窗口",
-                                "系统休眠或启动延迟超过 2 分钟，将等待下一次放号。"));
-                            this.WaitAfterCompletedAttempt(attempt, cancellationToken);
-                            continue;
-                        }
+                                RunState.Submitting,
+                                FriendlyState.Title(RunState.Submitting),
+                                this.FormatClockReadiness(clockEstimate)));
+                            if (!this.WaitUntil(effectiveRelease, cancellationToken))
+                            {
+                                return;
+                            }
+                            DateTime serverWindowNow = clockEstimate.HasSamples
+                                ? DateTime.Now.Add(clockEstimate.Offset)
+                                : DateTime.Now;
+                            if (serverWindowNow > attempt.ReleaseAt.AddMinutes(2))
+                            {
+                                this.Publish(StatusSnapshot.Create(
+                                    RunState.Failed,
+                                    "已错过本次放号窗口",
+                                    "系统休眠或启动延迟超过 2 分钟，将等待下一次放号。"));
+                                continue;
+                            }
 
-                        int totalAttempts = config.MaxRetries + 1;
-                        BookingResult finalResult = null;
-                        for (int attemptNumber = 1; attemptNumber <= totalAttempts; attemptNumber++)
-                        {
+                            int totalAttempts = config.MaxRetries + 1;
+                            BookingResult finalResult = null;
+                            DateTime submissionDeadline = effectiveRelease.AddMinutes(2);
+                            for (int attemptNumber = 1; ; attemptNumber++)
+                            {
                             if (cancellationToken.IsCancellationRequested)
                             {
                                 return;
@@ -196,7 +269,9 @@ namespace HkuLibrarySeatBooking
                                     : FriendlyState.Title(RunState.Retrying),
                                 attemptNumber == 1
                                     ? "正在向港大预约系统提交"
-                                    : "第 " + attemptNumber + "/" + totalAttempts + " 次提交");
+                                    : finalResult != null && finalResult.ConnectionFailure
+                                        ? "连接失败，第 " + attemptNumber + " 次持续重试"
+                                        : "第 " + attemptNumber + "/" + totalAttempts + " 次提交");
                             submitting.Attempt = attempt;
                             submitting.AttemptNumber = attemptNumber;
                             submitting.MaxAttempts = totalAttempts;
@@ -208,47 +283,60 @@ namespace HkuLibrarySeatBooking
                             {
                                 break;
                             }
-                            if (!result.Retryable || attemptNumber == totalAttempts)
+                            if (!result.Retryable)
+                            {
+                                break;
+                            }
+                            if (!result.ConnectionFailure && attemptNumber >= totalAttempts)
+                            {
+                                break;
+                            }
+                            if (DateTime.Now >= submissionDeadline)
                             {
                                 break;
                             }
 
-                            if (!this.Wait(config.RetryIntervalMs, cancellationToken))
+                            int retryDelayMs = result.ConnectionFailure
+                                ? BookingRetryPolicy.PreparationDelayMilliseconds(
+                                    DateTime.Now,
+                                    attempt.ReleaseAt)
+                                : config.RetryIntervalMs;
+                            if (!this.Wait(retryDelayMs, cancellationToken))
                             {
                                 return;
                             }
-                        }
+                            }
 
-                        StatusSnapshot completed;
-                        if (finalResult != null && finalResult.Success)
-                        {
-                            completed = StatusSnapshot.Create(
-                                RunState.Success,
-                                FriendlyState.Title(RunState.Success),
-                                finalResult.Message + " · " + attempt.TargetDate.ToString("MM-dd") + " " +
-                                attempt.Slot.StartText + "–" + attempt.Slot.EndText);
+                            StatusSnapshot completed;
+                            if (finalResult != null && finalResult.Success)
+                            {
+                                completed = StatusSnapshot.Create(
+                                    RunState.Success,
+                                    FriendlyState.Title(RunState.Success),
+                                    finalResult.Message + " · " + attempt.TargetDate.ToString("MM-dd") + " " +
+                                    attempt.Slot.StartText + "–" + attempt.Slot.EndText);
+                            }
+                            else if (finalResult != null && finalResult.AuthenticationRequired)
+                            {
+                                completed = StatusSnapshot.Create(
+                                    RunState.NeedsAttention,
+                                    FriendlyState.Title(RunState.NeedsAttention),
+                                    finalResult.Message);
+                            }
+                            else
+                            {
+                                completed = StatusSnapshot.Create(
+                                    RunState.Failed,
+                                    FriendlyState.Title(RunState.Failed),
+                                    finalResult == null ? "没有收到预约结果。" : finalResult.Message);
+                            }
+                            completed.Attempt = attempt;
+                            if (finalResult != null)
+                            {
+                                completed.Detail = finalResult.Message;
+                            }
+                            this.Publish(completed);
                         }
-                        else if (finalResult != null && finalResult.AuthenticationRequired)
-                        {
-                            completed = StatusSnapshot.Create(
-                                RunState.NeedsAttention,
-                                FriendlyState.Title(RunState.NeedsAttention),
-                                finalResult.Message);
-                        }
-                        else
-                        {
-                            completed = StatusSnapshot.Create(
-                                RunState.Failed,
-                                FriendlyState.Title(RunState.Failed),
-                                finalResult == null ? "没有收到预约结果。" : finalResult.Message);
-                        }
-                        completed.Attempt = attempt;
-                        if (finalResult != null)
-                        {
-                            completed.Detail = finalResult.Message;
-                        }
-                        this.Publish(completed);
-                        this.WaitAfterCompletedAttempt(attempt, cancellationToken);
                     }
                 }
             }
@@ -262,24 +350,6 @@ namespace HkuLibrarySeatBooking
                     "后台任务停止",
                     exception.Message));
             }
-        }
-
-        private void WaitAfterCompletedAttempt(BookingAttempt attempt, CancellationToken cancellationToken)
-        {
-            DateTime nextPrepare = attempt.ReleaseAt.AddDays(1).AddSeconds(-20);
-            if (nextPrepare <= DateTime.Now)
-            {
-                nextPrepare = DateTime.Now.AddMinutes(1);
-            }
-            if (!this.WaitUntil(nextPrepare, cancellationToken))
-            {
-                return;
-            }
-
-            this.Publish(StatusSnapshot.Create(
-                RunState.Waiting,
-                FriendlyState.Title(RunState.Waiting),
-                "等待下一次放号"));
         }
 
         private bool WaitUntil(DateTime target, CancellationToken cancellationToken)

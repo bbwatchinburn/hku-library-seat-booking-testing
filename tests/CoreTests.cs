@@ -24,15 +24,19 @@ namespace HkuLibrarySeatBooking
             RunTest("law library second slot mapping", TestLawLibrarySecondSlot);
             RunTest("chi wah hourly slot mapping", TestChiWahHourlySlots);
             RunTest("countdown format", TestCountdownFormat);
+            RunTest("adaptive preparation retry delays", TestPreparationRetryDelays);
             RunTest("form auto-detection", TestFormDetection);
             RunTest("explicit form overrides", TestExplicitOverrides);
             RunTest("select options and postback link", TestSelectAndPostback);
             RunTest("login form detection", TestLoginForm);
             RunTest("booking confirmation button detection", TestBookingConfirmationButton);
             RunTest("config normalization", TestConfigNormalization);
+            RunTest("connection failure classification", TestConnectionFailureClassification);
             RunTest("config persistence protects secrets", TestConfigPersistence);
             RunTest("target summary", TestTargetSummary);
             RunTest("multi-sample server clock calibration", TestServerClockCalibration);
+            RunTest("HEAD server clock sampling", TestHeadServerClockSampling);
+            RunTest("redacted HAR failure recording", TestHarFailureRecording);
             RunTest("multi-step ASP.NET booking flow", TestMultiStepBookingFlow);
 
             StringBuilder report = new StringBuilder();
@@ -149,6 +153,35 @@ namespace HkuLibrarySeatBooking
             Equal("01:02:03", ReleaseSchedule.FormatCountdown(new TimeSpan(1, 2, 3)), "same-day countdown");
             Equal("2天 03:04:05", ReleaseSchedule.FormatCountdown(new TimeSpan(2, 3, 4, 5)), "multi-day countdown");
             Equal("00:00:00", ReleaseSchedule.FormatCountdown(TimeSpan.FromSeconds(-4)), "negative countdown");
+        }
+
+        private static void TestPreparationRetryDelays()
+        {
+            DateTime release = new DateTime(2026, 11, 12, 0, 0, 0);
+            Equal(
+                500,
+                BookingRetryPolicy.PreparationDelayMilliseconds(
+                    release.AddSeconds(-1),
+                    release),
+                "pre-release retry delay");
+            Equal(
+                200,
+                BookingRetryPolicy.PreparationDelayMilliseconds(
+                    release.AddSeconds(2),
+                    release),
+                "early release-window retry delay");
+            Equal(
+                500,
+                BookingRetryPolicy.PreparationDelayMilliseconds(
+                    release.AddSeconds(15),
+                    release),
+                "middle release-window retry delay");
+            Equal(
+                1000,
+                BookingRetryPolicy.PreparationDelayMilliseconds(
+                    release.AddSeconds(60),
+                    release),
+                "late release-window retry delay");
         }
 
         private static void TestFormDetection()
@@ -333,6 +366,23 @@ namespace HkuLibrarySeatBooking
             }
         }
 
+        private static void TestConnectionFailureClassification()
+        {
+            BookingResult connectionFailure = BookingResult.Fail(
+                "connection reset",
+                true,
+                false,
+                true);
+            True(connectionFailure.ConnectionFailure, "connection failure flag");
+            True(connectionFailure.Retryable, "connection failure remains retryable");
+
+            BookingResult businessFailure = BookingResult.Fail(
+                "slot not open",
+                true,
+                false);
+            False(businessFailure.ConnectionFailure, "business failure is not a connection failure");
+        }
+
         private static void TestTargetSummary()
         {
             BookingConfig config = BookingConfig.CreateDefault();
@@ -379,6 +429,72 @@ namespace HkuLibrarySeatBooking
                 estimate.MedianRoundTrip >= TimeSpan.FromMilliseconds(100) &&
                 estimate.MedianRoundTrip <= TimeSpan.FromMilliseconds(300),
                 "median round-trip should be reported");
+        }
+
+        private static void TestHeadServerClockSampling()
+        {
+            using (MockBookingServer server = new MockBookingServer())
+            {
+                BookingConfig config = BookingConfig.CreateDefault();
+                config.BookingPageUrl = server.BaseUrl + "Secure/FacilityStatusDate.aspx";
+                using (HkuBookingClient client = new HkuBookingClient(
+                    config,
+                    string.Empty,
+                    string.Empty))
+                {
+                    ServerClockSample sample = client.SampleServerClock(
+                        config.BookingPageUrl,
+                        CancellationToken.None);
+                    NotNull(sample, "HEAD clock sample");
+                }
+
+                True(server.Methods.Count >= 1, "HEAD request recorded");
+                Equal("HEAD", server.Methods[0], "clock sample request method");
+            }
+        }
+
+        private static void TestHarFailureRecording()
+        {
+            string directory = Path.Combine(
+                Path.GetTempPath(),
+                "hku-har-tests-" + Guid.NewGuid().ToString("N"));
+            string path = Path.Combine(directory, "booking.har");
+            try
+            {
+                DateTime release = new DateTime(2026, 11, 12, 0, 0, 0);
+                CookieCollection cookies = new CookieCollection();
+                cookies.Add(new Cookie("ASP.NET_SessionId", "COOKIE_FIXTURE_SECRET"));
+                using (BookingHarRecorder recorder = new BookingHarRecorder(release, path))
+                {
+                    recorder.RecordFailure(
+                        "POST",
+                        "https://booking.lib.hku.hk/Secure/NewBooking.aspx?library=5&ftype=29&facility=258&date=20261113&session=19002000",
+                        DateTime.UtcNow.AddMilliseconds(-500),
+                        DateTime.UtcNow,
+                        "application/x-www-form-urlencoded",
+                        "__VIEWSTATE=VIEWSTATE_FIXTURE_SECRET&ctl00%24main%24listSession%2417=19002000",
+                        cookies,
+                        null,
+                        null,
+                        new WebException(
+                            "connection reset fixture",
+                            WebExceptionStatus.ReceiveFailure));
+                }
+
+                string json = File.ReadAllText(path);
+                True(json.Contains("\"version\":\"1.2\""), "HAR version");
+                True(json.Contains("ReceiveFailure"), "HAR failure status");
+                False(json.Contains("COOKIE_FIXTURE_SECRET"), "HAR cookie value redacted");
+                False(json.Contains("VIEWSTATE_FIXTURE_SECRET"), "HAR viewstate value redacted");
+                True(json.Contains("19002000"), "safe session value retained");
+            }
+            finally
+            {
+                if (Directory.Exists(directory))
+                {
+                    Directory.Delete(directory, true);
+                }
+            }
         }
 
         private static void TestMultiStepBookingFlow()
@@ -517,6 +633,7 @@ namespace HkuLibrarySeatBooking
                 this.listener.Start();
                 this.port = ((IPEndPoint)this.listener.LocalEndpoint).Port;
                 this.Requests = new List<string>();
+                this.Methods = new List<string>();
                 this.thread = new Thread(this.Listen);
                 this.thread.IsBackground = true;
                 this.thread.Start();
@@ -528,6 +645,7 @@ namespace HkuLibrarySeatBooking
             }
 
             public List<string> Requests { get; private set; }
+            public List<string> Methods { get; private set; }
 
             public void Dispose()
             {
@@ -555,6 +673,14 @@ namespace HkuLibrarySeatBooking
                             lock (this.Requests)
                             {
                                 this.Requests.Add(body);
+                            }
+                            string requestLine = request.Split(
+                                new[] { "\r\n" },
+                                StringSplitOptions.None)[0];
+                            string requestMethod = requestLine.Split(' ')[0];
+                            lock (this.Methods)
+                            {
+                                this.Methods.Add(requestMethod);
                             }
 
                             requestCount++;

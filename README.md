@@ -1,6 +1,6 @@
 # HKU Library Seat Booking
 
-> Current version: `0.1.5` - location-aware slot schedules, improved time calibration, and Chi Wah booking confirmation.
+> Current version: `0.1.6` - assisted Edge sign-in, sustained release-window retries, and faster preparation.
 
 A lightweight Windows 10/11 utility for booking seats at The University of Hong Kong (HKU) Libraries. After the user provides their own booking information, the app stays in the corner of the desktop, shows the release countdown and current status, and attempts to submit a booking at the configured release time. It continues monitoring for the next release unless the user closes it.
 
@@ -61,9 +61,15 @@ The `Custom Location` and experimental entries exist for page-level adaptation a
 - Supports a target date offset from `0` to `7` days after the release date.
 - Loads the booking page about 20 seconds before release and takes three server `Date` samples. Round-trip delay is removed from each sample, and the median offset is used to calibrate submission timing.
 - Retries transient TLS and network failures for read-only GET requests, while avoiding blind retries of booking POST requests.
+- Keeps retrying page preparation until two minutes after the release time, instead of abandoning the release after a short failure.
+- Performs one controlled page pre-refresh about 500 ms before release, then uses adaptive single-request retry delays: 200 ms in the first 5 seconds, 500 ms up to 30 seconds, and 1000 ms afterward.
+- Reuses a prepared page when its target date is already available, avoiding an extra full-page download at the release instant.
+- Uses lightweight HEAD requests for follow-up clock samples while retaining one full page load for form preparation.
+- Starts a redacted HAR recording two minutes before each release. It records request timing, status, safe form fields, HTTP failures, and connection exceptions, then saves the file whether booking succeeds or fails.
 - Understands ASP.NET WebForms fields including `__VIEWSTATE`, `__EVENTVALIDATION`, library, facility type, date, slot, seat, and submission controls.
 - Uses location-specific slot schedules and supports Chi Wah's hourly `Submit -> Yes` confirmation flow.
 - Supports Cookie-based sessions and ordinary HTML login forms. Cookie mode should be used when HKU redirects through single sign-on.
+- Provides an assisted Edge sign-in window. The user completes HKU SSO/MFA manually; the app imports the session locally without asking for manual Cookie extraction and never stores the HKU password for this flow.
 - Supports configurable retries from `0` to `50`, with a retry interval from `100` to `60000` milliseconds.
 - Provides a compact, borderless, always-on-top floating window that can be dragged and remembers its position.
 - Supports configurable opacity from `35%` to `100%`.
@@ -147,6 +153,10 @@ The build output is `bin\HkuLibrarySeatBooking.exe`.
 
 ## Getting the Browser Cookie
 
+The recommended method is to use **Sign in with Edge** in the settings window. It opens a dedicated Edge profile for this application. Complete the HKU sign-in there, and the app automatically imports the authenticated session without requiring manual DevTools work.
+
+The manual method below remains available as a fallback.
+
 1. Open `https://booking.lib.hku.hk/` in Microsoft Edge and sign in manually.
 2. Open a page such as `Facility Status`, `View By Date`, or `New Booking`.
 3. Press `F12` and open the **Network** tab.
@@ -160,13 +170,23 @@ The Cookie may include `ASP.NET_SessionId` and authentication cookies. Copy the 
 
 Do not send your Cookie, password, or settings file to anyone. The Cookie expires when the session ends or when HKU invalidates it.
 
+## Booking Diagnostics HAR
+
+The application starts a diagnostic HAR recorder two minutes before each release and saves it after the booking attempt finishes. The file is written to:
+
+`%LOCALAPPDATA%\HKU-Library-Seat-Booking\har\`
+
+The generated HAR includes request methods, URLs, timing, response status, safe booking fields, and network or TLS exception statuses. Cookie values, `Set-Cookie` values, passwords, ViewState, event-validation tokens, email addresses, and other personal fields are redacted. Response bodies are omitted to avoid saving personal booking data.
+
+This HAR is different from an Edge DevTools HAR: it records requests made by the application itself, including connection failures that never receive an HTTP response. It can identify whether the client observed `ReceiveFailure`, `ConnectFailure`, or `TrustFailure`, but it does not prove which network hop sent a TCP reset. Packet capture is still required to identify the exact sender of a reset packet.
+
 ## Advanced Adaptation
 
 The Advanced Adaptation tab is available for changes in the HKU booking page structure. Leave all fields empty for normal use.
 
 The app matches seats, time slots, and booking controls automatically. If the page changes, inspect the actual `name` and `value` attributes in the browser developer tools and enter the corresponding seat, slot, and submit fields manually.
 
-The application does not upload pages, Cookies, credentials, or personal information. Version `0.1.5` has no remote logging, crash reporting, email notification, or account synchronization.
+The application does not upload pages, Cookies, credentials, or personal information. Version `0.1.6` has no remote logging, crash reporting, email notification, or account synchronization.
 
 ## Input and Output Examples
 
@@ -255,6 +275,7 @@ The automated test suite covers:
 - weekday, weekend, Law Library, and Chi Wah slot mapping
 - location-specific slot-list switching
 - multi-sample server-clock calibration and round-trip correction
+- lightweight HEAD server-clock sampling
 - Chi Wah `Submit -> Yes` confirmation handling
 - target-date calculation and the post-release grace window
 - countdown formatting
@@ -265,7 +286,7 @@ The automated test suite covers:
 - target-summary generation
 - a multi-step booking flow against a local mock server
 
-Current result: `16/16` tests passed.
+Current result: `20/20` tests passed.
 
 The automated test does not submit a real HKU booking and does not send settings to an external server.
 
