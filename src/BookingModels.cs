@@ -162,7 +162,7 @@ namespace HkuLibrarySeatBooking
             this.ProtectedPassword = this.ProtectedPassword ?? string.Empty;
             this.ProtectedCookie = this.ProtectedCookie ?? string.Empty;
             this.SeatLabel = (this.SeatLabel ?? string.Empty).Trim();
-            this.TimeSlotIndex = Clamp(this.TimeSlotIndex, 0, 3);
+            this.TimeSlotIndex = Clamp(this.TimeSlotIndex, 0, 31);
             this.CustomStartTime = NormalizeClock(this.CustomStartTime, defaults.CustomStartTime);
             this.CustomEndTime = NormalizeClock(this.CustomEndTime, defaults.CustomEndTime);
             this.ReleaseTime = NormalizeClock(this.ReleaseTime, defaults.ReleaseTime);
@@ -258,8 +258,48 @@ namespace HkuLibrarySeatBooking
             "自定义时段"
         };
 
+        private static readonly BookingSlotPreset[] LawLibraryPresets =
+        {
+            new BookingSlotPreset { Name = "第 1 时段", Start = "09:00", End = "13:00" },
+            new BookingSlotPreset { Name = "第 2 时段", Start = "13:00", End = "18:00" },
+            new BookingSlotPreset { Name = "第 3 时段", Start = "18:00", End = "21:00" },
+            new BookingSlotPreset { Name = "自定义时段", IsCustom = true }
+        };
+
+        private static readonly BookingSlotPreset[] ChiWahPresets = CreateChiWahPresets();
+
+        public static string[] NamesForArea(string areaName)
+        {
+            IList<BookingSlotPreset> presets = PresetsForArea(areaName);
+            List<string> names = new List<string>();
+            foreach (BookingSlotPreset preset in presets)
+            {
+                names.Add(preset.Name);
+            }
+            return names.ToArray();
+        }
+
+        public static bool IsCustom(string areaName, int index)
+        {
+            IList<BookingSlotPreset> presets = PresetsForArea(areaName);
+            int safeIndex = Math.Max(0, Math.Min(index, presets.Count - 1));
+            return presets[safeIndex].IsCustom;
+        }
+
         public static BookingSlot Resolve(BookingConfig config, DateTime targetDate)
         {
+            if (IsLawLibrary(config.AreaName) || IsChiWah(config.AreaName))
+            {
+                IList<BookingSlotPreset> presets = PresetsForArea(config.AreaName);
+                int presetIndex = Math.Max(0, Math.Min(config.TimeSlotIndex, presets.Count - 1));
+                BookingSlotPreset preset = presets[presetIndex];
+                if (preset.IsCustom)
+                {
+                    return Create(preset.Name, config.CustomStartTime, config.CustomEndTime);
+                }
+                return Create(preset.Name, preset.Start, preset.End);
+            }
+
             bool weekend = targetDate.DayOfWeek == DayOfWeek.Saturday ||
                 targetDate.DayOfWeek == DayOfWeek.Sunday;
             int index = Math.Max(0, Math.Min(config.TimeSlotIndex, 3));
@@ -314,6 +354,71 @@ namespace HkuLibrarySeatBooking
                 EndText = end
             };
         }
+
+        private static IList<BookingSlotPreset> PresetsForArea(string areaName)
+        {
+            if (IsLawLibrary(areaName))
+            {
+                return LawLibraryPresets;
+            }
+            if (IsChiWah(areaName))
+            {
+                return ChiWahPresets;
+            }
+
+            List<BookingSlotPreset> defaults = new List<BookingSlotPreset>();
+            defaults.Add(new BookingSlotPreset { Name = "第 1 时段", Start = "08:30", End = "13:00" });
+            defaults.Add(new BookingSlotPreset { Name = "第 2 时段", Start = "13:00", End = "18:00" });
+            defaults.Add(new BookingSlotPreset { Name = "第 3 时段", Start = "18:00", End = "22:00" });
+            defaults.Add(new BookingSlotPreset { Name = "自定义时段", IsCustom = true });
+            return defaults;
+        }
+
+        private static BookingSlotPreset[] CreateChiWahPresets()
+        {
+            List<BookingSlotPreset> presets = new List<BookingSlotPreset>();
+            for (int hour = 0; hour < 6; hour++)
+            {
+                AddHourlyPreset(presets, hour, hour + 1);
+            }
+            for (int hour = 8; hour < 23; hour++)
+            {
+                AddHourlyPreset(presets, hour, hour + 1);
+            }
+            presets.Add(new BookingSlotPreset { Name = "23:00–23:45", Start = "23:00", End = "23:45" });
+            presets.Add(new BookingSlotPreset { Name = "自定义时段", IsCustom = true });
+            return presets.ToArray();
+        }
+
+        private static void AddHourlyPreset(List<BookingSlotPreset> presets, int startHour, int endHour)
+        {
+            string start = startHour.ToString("00", CultureInfo.InvariantCulture) + ":00";
+            string end = endHour.ToString("00", CultureInfo.InvariantCulture) + ":00";
+            presets.Add(new BookingSlotPreset
+            {
+                Name = start + "–" + end,
+                Start = start,
+                End = end
+            });
+        }
+
+        private static bool IsLawLibrary(string areaName)
+        {
+            return (areaName ?? string.Empty).IndexOf("Law", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsChiWah(string areaName)
+        {
+            return (areaName ?? string.Empty).IndexOf("Chi Wah", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+    }
+
+    internal sealed class BookingSlotPreset
+    {
+        public string Name { get; set; }
+        public string Start { get; set; }
+        public string End { get; set; }
+        public bool IsCustom { get; set; }
     }
 
     internal enum RunState
@@ -403,6 +508,7 @@ namespace HkuLibrarySeatBooking
             new AreaPreset { Name = "Main Library Level 3 Study Tables", Url = "https://booking.lib.hku.hk/Secure/FacilityStatusDate.aspx" },
             new AreaPreset { Name = "Deep Quiet Room Study Tables", Url = "https://booking.lib.hku.hk/Secure/FacilityStatusDate.aspx" },
             new AreaPreset { Name = "Law Library Study Tables", Url = "https://booking.lib.hku.hk/Secure/FacilityStatusDate.aspx" },
+            new AreaPreset { Name = "Chi Wah Learning Commons Study Rooms", Url = "https://booking.lib.hku.hk/Secure/FacilityStatusDate.aspx" },
             new AreaPreset { Name = "Main Library Single Study Rooms", Url = "https://booking.lib.hku.hk/FView.aspx?lib=3&ftype=31" },
             new AreaPreset { Name = "自定义馆区", Url = "https://booking.lib.hku.hk/" }
         };

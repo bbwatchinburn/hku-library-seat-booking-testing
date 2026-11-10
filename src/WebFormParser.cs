@@ -413,6 +413,34 @@ namespace HkuLibrarySeatBooking
             return null;
         }
 
+        public static FormChoice BuildNamedSubmitChoice(string html, string submitNameSuffix)
+        {
+            foreach (HtmlForm form in ParseForms(html))
+            {
+                foreach (HtmlControl control in form.Controls)
+                {
+                    string type = (control.Type ?? string.Empty).ToLowerInvariant();
+                    if ((type == "submit" || type == "button") &&
+                        (control.Name ?? string.Empty).EndsWith(
+                            submitNameSuffix,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        IDictionary<string, string> fields = form.BuildSubmission();
+                        fields[control.Name] = control.Value ?? string.Empty;
+                        return new FormChoice
+                        {
+                            Form = form,
+                            Fields = fields,
+                            SubmitControl = control,
+                            SubmitName = control.Name,
+                            SubmitValue = control.Value
+                        };
+                    }
+                }
+            }
+            return null;
+        }
+
         public static string EncodeForm(IDictionary<string, string> fields)
         {
             StringBuilder builder = new StringBuilder();

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 
@@ -6,6 +7,9 @@ namespace HkuLibrarySeatBooking
 {
     internal sealed class BookingScheduler
     {
+        private const int ClockSampleCount = 3;
+        private const int ClockSampleIntervalMs = 150;
+
         private readonly object sync = new object();
         private readonly Action<StatusSnapshot> statusChanged;
         private Thread worker;
@@ -92,18 +96,48 @@ namespace HkuLibrarySeatBooking
                         "正在获取预约页面并同步服务器时间"));
 
                     DateTime effectiveRelease = attempt.ReleaseAt;
+                    ServerClockEstimate clockEstimate = new ServerClockEstimate();
                     using (HkuBookingClient client = new HkuBookingClient(config, password, cookie))
                     {
                         try
                         {
-                            PreparedPage page = client.Prepare(config.BookingPageUrl, cancellationToken);
-                            if (page.ServerUtc.HasValue)
+                            List<ServerClockSample> clockSamples = new List<ServerClockSample>();
+                            PreparedPage page = null;
+                            for (int sampleIndex = 0; sampleIndex < ClockSampleCount; sampleIndex++)
                             {
-                                TimeSpan offset = page.ServerUtc.Value - DateTime.UtcNow;
-                                if (Math.Abs(offset.TotalSeconds) >= 1)
+                                try
                                 {
-                                    effectiveRelease = attempt.ReleaseAt.Subtract(offset);
+                                    page = client.Prepare(config.BookingPageUrl, cancellationToken);
                                 }
+                                catch (BookingAuthenticationException)
+                                {
+                                    throw;
+                                }
+                                catch
+                                {
+                                    if (clockSamples.Count == 0)
+                                    {
+                                        throw;
+                                    }
+                                    break;
+                                }
+
+                                if (page.ClockSample != null)
+                                {
+                                    clockSamples.Add(page.ClockSample);
+                                }
+
+                                if (sampleIndex + 1 < ClockSampleCount &&
+                                    !this.Wait(ClockSampleIntervalMs, cancellationToken))
+                                {
+                                    return;
+                                }
+                            }
+
+                            clockEstimate = ServerClockCalibration.Estimate(clockSamples);
+                            if (clockEstimate.HasSamples)
+                            {
+                                effectiveRelease = attempt.ReleaseAt.Subtract(clockEstimate.Offset);
                             }
                         }
                         catch (BookingAuthenticationException exception)
@@ -128,12 +162,15 @@ namespace HkuLibrarySeatBooking
                         this.Publish(StatusSnapshot.Create(
                             RunState.Submitting,
                             FriendlyState.Title(RunState.Submitting),
-                            "已准备就绪，等待放号时刻"));
+                            this.FormatClockReadiness(clockEstimate)));
                         if (!this.WaitUntil(effectiveRelease, cancellationToken))
                         {
                             return;
                         }
-                        if (DateTime.Now > attempt.ReleaseAt.AddMinutes(2))
+                        DateTime serverWindowNow = clockEstimate.HasSamples
+                            ? DateTime.Now.Add(clockEstimate.Offset)
+                            : DateTime.Now;
+                        if (serverWindowNow > attempt.ReleaseAt.AddMinutes(2))
                         {
                             this.Publish(StatusSnapshot.Create(
                                 RunState.Failed,
@@ -275,6 +312,18 @@ namespace HkuLibrarySeatBooking
                 }
             }
             return false;
+        }
+
+        private string FormatClockReadiness(ServerClockEstimate estimate)
+        {
+            if (estimate == null || !estimate.HasSamples)
+            {
+                return "已准备就绪，等待放号时刻 · 未取得服务器时间，使用本机时钟";
+            }
+
+            return "已准备就绪，等待放号时刻 · 校时 " + estimate.SampleCount +
+                " 次 · 中位往返 " + Math.Max(0, (int)Math.Round(estimate.MedianRoundTrip.TotalMilliseconds)) +
+                " ms";
         }
 
         private bool Wait(int milliseconds, CancellationToken cancellationToken)
